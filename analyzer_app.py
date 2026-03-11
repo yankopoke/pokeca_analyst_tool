@@ -293,6 +293,18 @@ class AnalyzerApp:
         self.btn_hide_all = ttk.Button(btn_frame, text="選択解除", command=self.hide_all_lines)
         self.btn_hide_all.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
 
+        # 対数スケールチェックボックス
+        scale_frame = ttk.Frame(graph_control_frame)
+        scale_frame.pack(fill=tk.X, pady=(10, 0))
+        self.log_scale_var = tk.BooleanVar(value=False)
+        self.log_scale_cb = ttk.Checkbutton(
+            scale_frame, 
+            text="Y軸を対数表示", 
+            variable=self.log_scale_var, 
+            command=self.on_log_scale_toggle
+        )
+        self.log_scale_cb.pack(anchor=tk.W)
+
         self.current_data = []
         self.current_columns = []
         self.pie_wedges = []
@@ -701,6 +713,15 @@ class AnalyzerApp:
             legline.set_alpha(alpha_val)
             legtext.set_alpha(alpha_val)
 
+    def on_log_scale_toggle(self):
+        selection = self.analysis_var.get()
+        if selection.startswith("3") or selection.startswith("4"):
+            if self.log_scale_var.get():
+                self.ax.set_yscale("symlog")
+            else:
+                self.ax.set_yscale("linear")
+            self.canvas.draw_idle()
+
     def on_listbox_select(self, event):
         selected_indices = self.label_listbox.curselection()
         for i in range(self.label_listbox.size()):
@@ -802,16 +823,20 @@ class AnalyzerApp:
             self.deck_name_var.set("") # クリア
             self.deck_name_combo.config(state="disabled")
             self.interval_combo.config(state="disabled")
+            self.log_scale_cb.config(state="disabled")
         elif selection.startswith("2"):
             self.deck_name_combo.config(state="readonly")
             self.interval_combo.config(state="disabled")
+            self.log_scale_cb.config(state="disabled")
         elif selection.startswith("3"):
             self.deck_name_var.set("") # クリア
             self.deck_name_combo.config(state="disabled")
             self.interval_combo.config(state="readonly")
+            self.log_scale_cb.config(state="normal")
         elif selection.startswith("4"):
             self.deck_name_combo.config(state="readonly")
             self.interval_combo.config(state="readonly")
+            self.log_scale_cb.config(state="normal")
 
     def get_period_format(self):
         val = self.interval_var.get()
@@ -866,45 +891,30 @@ class AnalyzerApp:
                     if end_date:
                         date_filter += " AND e.event_date <= ?"
                         params.append(end_date)
-                        
-                    date_filter_sub = ""
-                    params_sub = []
-                    if start_date:
-                        date_filter_sub += " AND e2.event_date >= ?"
-                        params_sub.append(start_date)
-                    if end_date:
-                        date_filter_sub += " AND e2.event_date <= ?"
-                        params_sub.append(end_date)
 
                     query = f"""
+                    WITH filtered_results AS (
+                        SELECT r.id, r.deck_type
+                        FROM results r
+                        JOIN events e ON r.event_id = e.id
+                        WHERE r.deck_type IS NOT NULL
+                        {date_filter}
+                        {rank_cond}
+                    ),
+                    total_count AS (
+                        SELECT COUNT(id) AS total FROM filtered_results
+                    )
                     SELECT 
-                        r.deck_type AS デッキタイプ名,
-                        COUNT(r.id) AS 入賞数,
-                        ROUND(CAST(COUNT(r.id) AS FLOAT) * 100.0 / (
-                            SELECT COUNT(r2.id) FROM results r2
-                            JOIN events e2 ON r2.event_id = e2.id
-                            WHERE r2.deck_type IS NOT NULL {date_filter_sub} {self.get_rank_filter_condition('r2')}
-                        ), 2) AS シェア率_パーセント
-                    FROM results r
-                    JOIN events e ON r.event_id = e.id
-                    WHERE r.deck_type IS NOT NULL
-                    {date_filter}
-                    {rank_cond}
-                    GROUP BY r.deck_type
+                        deck_type AS デッキタイプ名,
+                        COUNT(id) AS 入賞数,
+                        ROUND(CAST(COUNT(id) AS FLOAT) * 100.0 / (SELECT total FROM total_count), 2) AS シェア率_パーセント
+                    FROM filtered_results
+                    GROUP BY deck_type
                     ORDER BY 入賞数 DESC
                     """
-                    cursor.execute(query, tuple(params_sub + params))
+                    cursor.execute(query, tuple(params))
                 
                 elif selection.startswith("2"):
-                    date_filter_sub = ""
-                    params_sub = [deck_name]
-                    if start_date:
-                        date_filter_sub += " AND e.event_date >= ?"
-                        params_sub.append(start_date)
-                    if end_date:
-                        date_filter_sub += " AND e.event_date <= ?"
-                        params_sub.append(end_date)
-
                     date_filter = ""
                     params = [deck_name]
                     if start_date:
@@ -915,33 +925,46 @@ class AnalyzerApp:
                         params.append(end_date)
 
                     query = f"""
+                    WITH target_results AS (
+                        SELECT r.id
+                        FROM results r
+                        JOIN events e ON r.event_id = e.id
+                        WHERE r.deck_type = ?
+                        {date_filter}
+                        {rank_cond}
+                    ),
+                    deck_total AS (
+                        SELECT COUNT(id) AS total FROM target_results
+                    ),
+                    card_counts AS (
+                        SELECT 
+                            c.result_id,
+                            c.normalized_card_name as card_name,
+                            SUM(c.quantity) as total_qty
+                        FROM deck_cards c
+                        JOIN target_results tr ON tr.id = c.result_id
+                        WHERE c.normalized_card_name IS NOT NULL
+                        GROUP BY c.result_id, c.normalized_card_name
+                    )
                     SELECT
-                        c.normalized_card_name AS カード名,
-                        ROUND(CAST(COUNT(DISTINCT c.result_id) AS FLOAT) * 100.0 / (
-                            SELECT COUNT(r.id) FROM results r 
-                            JOIN events e ON r.event_id = e.id
-                            WHERE r.deck_type = ? {date_filter_sub} {self.get_rank_filter_condition('r')}
-                        ), 2) AS 採用率_パーセント,
-                        ROUND(CAST(SUM(c.quantity) AS FLOAT) / COUNT(DISTINCT c.result_id), 2) AS 平均採用枚数,
-                        SUM(CASE WHEN c.quantity = 1 THEN 1 ELSE 0 END) AS "1枚",
-                        ROUND(CAST(SUM(CASE WHEN c.quantity = 1 THEN 1 ELSE 0 END) AS FLOAT) * 100.0 / COUNT(DISTINCT c.result_id), 2) AS "1枚_割合(%)",
-                        SUM(CASE WHEN c.quantity = 2 THEN 1 ELSE 0 END) AS "2枚",
-                        ROUND(CAST(SUM(CASE WHEN c.quantity = 2 THEN 1 ELSE 0 END) AS FLOAT) * 100.0 / COUNT(DISTINCT c.result_id), 2) AS "2枚_割合(%)",
-                        SUM(CASE WHEN c.quantity = 3 THEN 1 ELSE 0 END) AS "3枚",
-                        ROUND(CAST(SUM(CASE WHEN c.quantity = 3 THEN 1 ELSE 0 END) AS FLOAT) * 100.0 / COUNT(DISTINCT c.result_id), 2) AS "3枚_割合(%)",
-                        SUM(CASE WHEN c.quantity = 4 THEN 1 ELSE 0 END) AS "4枚",
-                        ROUND(CAST(SUM(CASE WHEN c.quantity = 4 THEN 1 ELSE 0 END) AS FLOAT) * 100.0 / COUNT(DISTINCT c.result_id), 2) AS "4枚_割合(%)"
-                    FROM deck_cards c
-                    JOIN results r ON r.id = c.result_id
-                    JOIN events e ON r.event_id = e.id
-                    WHERE r.deck_type = ?
-                      AND c.normalized_card_name IS NOT NULL
-                    {date_filter}
-                    {rank_cond}
-                    GROUP BY c.normalized_card_name
+                        card_name AS カード名,
+                        ROUND(CAST(COUNT(result_id) AS FLOAT) * 100.0 / (SELECT total FROM deck_total), 2) AS 採用率_パーセント,
+                        ROUND(CAST(SUM(total_qty) AS FLOAT) / COUNT(result_id), 2) AS 平均採用枚数,
+                        (SELECT total FROM deck_total) - COUNT(result_id) AS "0枚",
+                        ROUND(CAST((SELECT total FROM deck_total) - COUNT(result_id) AS FLOAT) * 100.0 / (SELECT total FROM deck_total), 2) AS "0枚_割合(%)",
+                        SUM(CASE WHEN total_qty = 1 THEN 1 ELSE 0 END) AS "1枚",
+                        ROUND(CAST(SUM(CASE WHEN total_qty = 1 THEN 1 ELSE 0 END) AS FLOAT) * 100.0 / (SELECT total FROM deck_total), 2) AS "1枚_割合(%)",
+                        SUM(CASE WHEN total_qty = 2 THEN 1 ELSE 0 END) AS "2枚",
+                        ROUND(CAST(SUM(CASE WHEN total_qty = 2 THEN 1 ELSE 0 END) AS FLOAT) * 100.0 / (SELECT total FROM deck_total), 2) AS "2枚_割合(%)",
+                        SUM(CASE WHEN total_qty = 3 THEN 1 ELSE 0 END) AS "3枚",
+                        ROUND(CAST(SUM(CASE WHEN total_qty = 3 THEN 1 ELSE 0 END) AS FLOAT) * 100.0 / (SELECT total FROM deck_total), 2) AS "3枚_割合(%)",
+                        SUM(CASE WHEN total_qty >= 4 THEN 1 ELSE 0 END) AS "4枚以上",
+                        ROUND(CAST(SUM(CASE WHEN total_qty >= 4 THEN 1 ELSE 0 END) AS FLOAT) * 100.0 / (SELECT total FROM deck_total), 2) AS "4枚以上_割合(%)"
+                    FROM card_counts
+                    GROUP BY card_name
                     ORDER BY 採用率_パーセント DESC
                     """
-                    cursor.execute(query, tuple(params_sub + params))
+                    cursor.execute(query, tuple(params))
 
                 elif selection.startswith("3"):
                     date_filter = ""
@@ -970,54 +993,86 @@ class AnalyzerApp:
 
                 elif selection.startswith("4"):
                     date_filter = ""
-                    params_sub = [deck_name]
                     params = [deck_name]
                     
                     if start_date:
                         date_filter += " AND e.event_date >= ?"
-                        params_sub.append(start_date)
                         params.append(start_date)
                     if end_date:
                         date_filter += " AND e.event_date <= ?"
-                        params_sub.append(end_date)
                         params.append(end_date)
 
                     query = f"""
-                    WITH DeckTotalPerPeriod AS (
+                    WITH target_results AS (
                         SELECT 
-                            strftime('{period_fmt}', e.event_date) AS period,
-                            COUNT(r.id) AS total_decks
+                            r.id,
+                            strftime('{period_fmt}', e.event_date) AS period
                         FROM results r
                         JOIN events e ON r.event_id = e.id
-                        WHERE r.deck_type = ? {date_filter} {rank_cond}
+                        WHERE r.deck_type = ?
+                        {date_filter}
+                        {rank_cond}
+                    ),
+                    deck_total_per_period AS (
+                        SELECT 
+                            period,
+                            COUNT(id) AS total_decks
+                        FROM target_results
                         GROUP BY period
                     )
                     SELECT 
-                        strftime('{period_fmt}', e.event_date) AS 開催期間,
+                        tr.period AS 開催期間,
                         c.normalized_card_name AS カード名,
-                        ROUND(CAST(COUNT(DISTINCT c.result_id) AS FLOAT) * 100.0 / p.total_decks, 2) AS 採用率_パーセント,
-                        ROUND(CAST(SUM(c.quantity) AS FLOAT) / COUNT(DISTINCT c.result_id), 2) AS 平均採用枚数
+                        ROUND(CAST(COUNT(DISTINCT c.result_id) AS FLOAT) * 100.0 / dt.total_decks, 2) AS 採用率_パーセント,
+                        ROUND(CAST(SUM(c.quantity) AS FLOAT) / COUNT(DISTINCT c.result_id), 2) AS 平均採用枚数,
+                        dt.total_decks AS 総デッキ数
                     FROM deck_cards c
-                    JOIN results r ON r.id = c.result_id
-                    JOIN events e ON r.event_id = e.id
-                    JOIN DeckTotalPerPeriod p ON p.period = strftime('{period_fmt}', e.event_date)
-                    WHERE r.deck_type = ?
-                      AND c.normalized_card_name IS NOT NULL
-                    {date_filter}
-                    {rank_cond}
+                    JOIN target_results tr ON tr.id = c.result_id
+                    JOIN deck_total_per_period dt ON dt.period = tr.period
+                    WHERE c.normalized_card_name IS NOT NULL
                     GROUP BY 
-                        開催期間, 
-                        カード名,
-                        p.total_decks
+                        tr.period, 
+                        c.normalized_card_name,
+                        dt.total_decks
                     ORDER BY 
-                        開催期間 ASC
+                        tr.period ASC
                     """
-                    cursor.execute(query, tuple(params_sub + params))
+                    cursor.execute(query, tuple(params))
 
                 columns = [desc[0] for desc in cursor.description]
                 rows = cursor.fetchall()
                 
-                if selection.startswith("4"):
+                if selection.startswith("3"):
+                    # Treeviewを表示してCanvas（ヒートマップ）を隠す
+                    self.heat_frame.pack_forget()
+                    self.tree_frame.pack(fill=tk.BOTH, expand=True)
+
+                    # ピボットテーブルを作成
+                    raw_rows = rows
+                    periods = sorted(list(set([r[0] for r in raw_rows])))
+                    deck_data = {}
+                    for row in raw_rows:
+                        period, deck_type, count = row
+                        if deck_type not in deck_data:
+                            deck_data[deck_type] = {}
+                        deck_data[deck_type][period] = count
+
+                    table_columns = ["デッキタイプ名"] + periods + ["合計"]
+                    deck_totals = {d: sum(deck_data[d].values()) for d in deck_data}
+                    sorted_decks = sorted(deck_data.keys(), key=lambda d: deck_totals[d], reverse=True)
+
+                    pivoted_rows = []
+                    for deck in sorted_decks:
+                        row_data = [deck]
+                        for p in periods:
+                            row_data.append(deck_data[deck].get(p, 0))
+                        row_data.append(deck_totals[deck])
+                        pivoted_rows.append(row_data)
+
+                    self.update_table(table_columns, pivoted_rows)
+                    self.plot_graph(selection, columns, raw_rows)
+
+                elif selection.startswith("4"):
                     # Treeviewを隠してCanvas（ヒートマップ）を表示
                     self.tree_frame.pack_forget()
                     self.heat_frame.pack(fill=tk.BOTH, expand=True)
@@ -1025,14 +1080,15 @@ class AnalyzerApp:
                     # 表表示用にクロス集計（ピボット）を作成
                     raw_rows = rows
                     periods = sorted(list(set([r[0] for r in raw_rows])))
+                    period_totals = {r[0]: r[4] for r in raw_rows}
                     card_data = {}
                     for row in raw_rows:
-                        period, card, rate, avg = row
+                        period, card, rate, avg, total_decks = row
                         if card not in card_data:
                             card_data[card] = {}
                         card_data[card][period] = (rate, avg)
 
-                    table_columns = ["カード名"] + periods
+                    table_columns = ["カード名"] + [f"{p}\n({period_totals[p]}デッキ)" for p in periods]
                     
                     # ソート設定（全期間の平均採用率を基準に降順ソート）
                     def sort_key(card):
@@ -1045,10 +1101,13 @@ class AnalyzerApp:
                     for widget in self.heat_inner_frame.winfo_children():
                         widget.destroy()
 
-                    # ヘッダー描画
+                    # ヘッダー描画（注釈追加）
+                    notice_lbl = tk.Label(self.heat_inner_frame, text="※セルの値は「平均採用枚数 (採用率)」を示しています。", bg="#fff3cd", fg="#856404", anchor="w", padx=5, pady=2)
+                    notice_lbl.grid(row=0, column=0, columnspan=len(table_columns), sticky="ew")
+
                     for col_idx, col_name in enumerate(table_columns):
                         lbl = tk.Label(self.heat_inner_frame, text=col_name, bg="#f0f0f0", relief=tk.RIDGE, bd=1, padx=5, pady=5)
-                        lbl.grid(row=0, column=col_idx, sticky="nsew")
+                        lbl.grid(row=1, column=col_idx, sticky="nsew")
                         # 列の幅を定義
                         if col_idx == 0:
                             self.heat_inner_frame.columnconfigure(col_idx, minsize=180) # カード名
@@ -1059,7 +1118,7 @@ class AnalyzerApp:
                     self.current_data = [] # 生データ保存用(CSV出力用)
 
                     # データ行描画
-                    for row_idx, card in enumerate(sorted_cards, start=1):
+                    for row_idx, card in enumerate(sorted_cards, start=2):
                         row_data_csv = [card]
                         
                         # カード名セル
@@ -1070,7 +1129,7 @@ class AnalyzerApp:
                             if p in card_data[card]:
                                 rate, avg = card_data[card][p]
                                 avg_str = f"{int(avg)}" if avg.is_integer() else f"{avg:.1f}"
-                                text = f"{avg_str} ({int(rate)}%)"
+                                text = f"{avg_str}枚 ({int(rate)}%)"
                                 row_data_csv.append(text)
                                 
                                 # セルごとの色計算（平均採用枚数ベース: 0〜4の5段階）
@@ -1138,16 +1197,28 @@ class AnalyzerApp:
         self.current_columns = columns
         self.current_data = rows
 
+        # UI設定: 交互の行色
+        self.tree.tag_configure("evenrow", background="#f9f9f9")
+        self.tree.tag_configure("oddrow", background="#ffffff")
+
         # カラム設定
         self.tree["columns"] = columns
         for col in columns:
             self.tree.heading(col, text=col, command=lambda _col=col: self.treeview_sort_column(_col, False))
-            # 文字列長に応じて大まかに幅調整
-            self.tree.column(col, width=150, anchor=tk.W)
+            # カラム名に応じた幅とアンカーの調整
+            if col == "カード名" or col == "デッキタイプ名":
+                self.tree.column(col, width=200, anchor=tk.W)
+            elif "割合" in col or "パーセント" in col:
+                self.tree.column(col, width=90, anchor=tk.E)
+            elif "枚" in col or "数" in col or "合計" in col:
+                self.tree.column(col, width=80, anchor=tk.E)
+            else:
+                self.tree.column(col, width=100, anchor=tk.CENTER)
 
         # データ挿入
-        for row in rows:
-            self.tree.insert("", tk.END, values=row)
+        for i, row in enumerate(rows):
+            tag = "evenrow" if i % 2 == 0 else "oddrow"
+            self.tree.insert("", tk.END, values=row, tags=(tag,))
 
     def plot_graph(self, selection, columns, rows, is_raw=False):
         # 現在のウィジェットサイズに合わせてFigureサイズを同期（リサイズイベント削除の補填）
@@ -1326,6 +1397,12 @@ class AnalyzerApp:
         else:
             self.ax.text(0.5, 0.5, '時系列分析(3, 4)選択時に\nグラフが表示されます。', ha='center', va='center')
         
+        if selection.startswith("3") or selection.startswith("4"):
+            if self.log_scale_var.get():
+                self.ax.set_yscale("symlog")
+            else:
+                self.ax.set_yscale("linear")
+
         # グラフを描画するタイミングでレイアウトを整える
         self.refresh_layout()
         self.canvas.draw()

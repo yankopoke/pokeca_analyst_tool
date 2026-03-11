@@ -1,67 +1,180 @@
-# ポケモンカード シティリーグ スクレイピングシステム 開発完了報告
+# ポケカ シティリーグ 分析ツール 運用ガイド
 
-ご要望通り、ポケモンカードの公式プレイヤーズクラブからシティリーグ（オープンリーグ）の大会結果と上位8名のデッキデータをスクレイピングし、データベースに蓄積するシステムを構築しました。
+## システム概要
 
-## 実装内容
+ポケモンカード公式サイトからシティリーグ（オープンリーグ）の大会結果・デッキ情報をスクレイピングし、データベースに蓄積・可視化するツールです。
 
-1. **イベント検索アーキテクチャ**
-   - イベント一覧はPlaywrightを使わず、公式のJSON API(`event_search`) を直接叩くことで高速かつ安定して取得するようにしました。
-   - `order=4` (新着順) と `result_resist=1` (結果登録済み) を指定しています。
-   - オープンリーグ（`event_type=3:1`, `3:2`, `3:7` を全取得後 `leagueName="オープン"` でフィルタ）で2026年1月23日以降の大会のみを収集します。
-
-2. **大会結果・デッキ スクレイパー**
-   - ページがJavaScriptで動的に生成される (SPA) ため、`playwright` を使用してブラウザ操作を自動化しました。
-   - 大会結果ページから「1位〜ベスト8」のプレイヤー名、順位、デッキIDを抽出します。
-   - デッキページでは「リスト表示」に切り替え、DOMテキストを解析してカード名、カード番号、枚数を正確に抽出します。
-   - 1つのデッキに対して約60枚分のカードデータが取得できる仕様です。
-
-3. **データベース設計**
-   `sqlite` (`cityresu.db`) と `sqlalchemy` を用い、3つのテーブルをリレーショナルに設計しました。
-   - `events`: 大会基本情報（開催日、店舗、都道府県、定員）
-   - `results`: 結果（イベントID、順位、プレイヤー名、デッキ名 `deck_type`）
-   - `deck_cards`: デッキ（結果ID、カード名、カード番号、枚数）
-
-4. **AIデッキタイプ判別 (OpenAI `gpt-5-mini`)**
-   - スクレイピングで集めた60枚の「カード名・枚数」一覧を生成AIに分析させ、デッキのアーキタイプ名（主軸ポケモンなど）を自動で推論・名付けします。
-   - 分析結果は `results` テーブルの `deck_type` カラムへ保存されます。
-
-5. **ブロック対策**
-   - 短期間の大量アクセスによるIPブロックを防ぐため、`config.py` にスリープ時間を設定（ページ推移2秒、イベント間3秒、デッキ間3秒）し、行儀の良いスクレイピングを実現しました。
-
-## 使い方
-
-日次で以下の処理を実行することで、新規データベースの追加・更新とデッキ判定が可能です。
-
-### 1. スクレイピング（データ収集）
-```bash
-cd c:\Users\naga4\cityresu_scrape
-python main.py
+```
+スクレイピング → DB保存 → デッキタイプ判別 → GUI / レポートで分析
 ```
 
-特定的フェーズのみを実行したい場合:
-- `python main.py --events` (新規イベントのみ検索・保存)
-- `python main.py --results` (結果未取得のイベント結果を保存)
-- `python main.py --decks` (デッキ未取得のリストを保存)
+---
 
-### 日付範囲の指定（期間絞り込み）
-特定の期間の大会のみを取得したい場合は、`--start-date` および `--end-date` オプションを追加します（形式は `YYYY-MM-DD`）。
+## ファイル一覧
 
-**例：1月23日から2月末までの取得**
-```bash
+| ファイル | 役割 |
+|---|---|
+| `update_all.py` | **一括更新スクリプト（メイン運用コマンド）** |
+| `main.py` | スクレイピングパイプライン（イベント→結果→デッキ） |
+| `scraper_events.py` | 公式APIからイベント一覧を取得 |
+| `analyze_decks.py` | ルールベースでデッキタイプを判別・DB更新 |
+| `deck_rules.json` | デッキタイプ判別ルール定義 |
+| `analyzer_app.py` | GUIアプリ（Tkinter製 分析ツール） |
+| `create_report.py` | デッキ一覧HTMLレポートを生成 |
+| `normalize_data.py` | カード名の名寄せ処理 |
+| `cleanup_database.py` | 不正データの削除ツール |
+| `models.py` | DBモデル（SQLAlchemy） |
+| `config.py` | 設定ファイル |
+| `cityresu.db` | SQLiteデータベース |
+
+---
+
+## 通常運用（定期更新）
+
+### `update_all.py` — 一括更新スクリプト
+
+DBの最終更新日を自動検出し、**実行日の3日前まで**のデータを取得してデッキタイプも付与します。
+
+```powershell
+cd c:\Users\naga4\cityresu_scrape
+python update_all.py
+```
+
+**処理順序:**
+1. DBの最新イベント日付を取得（前回更新日）
+2. 前回更新日+1日 〜 実行日-3日 の期間でスクレイピング
+3. イベント情報 → 大会結果 → デッキリストの順に取得・DB保存
+4. カード名の名寄せ（括弧付き表記を統一）
+5. ルールベースでデッキタイプ（でっきたぷ）を自動付与
+
+> **なぜ3日前まで？**  
+> 公式サイトへのデッキ登録に若干のラグがあるため、直近3日は意図的に除外しています。
+
+#### オプション
+
+```powershell
+# 実際のスクレイピングは行わず、対象期間だけ確認する
+python update_all.py --dry-run
+
+# 日付を手動指定する
+python update_all.py --start-date 2026-02-01 --end-date 2026-03-01
+```
+
+ログは `update_all.log` にも保存されます。
+
+---
+
+## 個別スクリプトの使い方
+
+### スクレイピング（`main.py`）
+
+フェーズを個別実行したい場合に使用します。
+
+```powershell
+python main.py               # 全パイプライン実行
+python main.py --events      # イベント検索のみ
+python main.py --results     # 結果取得のみ
+python main.py --decks       # デッキ取得のみ
 python main.py --start-date 2026-01-23 --end-date 2026-02-28
 ```
 
-### 2. AIによるデッキ判別（アーキタイプ名登録）
-`.env` ファイルに設定された `OPENAI_API_KEY` を用いて、未分類のデッキに名前を付けます。
-```bash
-python analyze_decks.py
+### デッキタイプ判別（`analyze_decks.py`）
+
+```powershell
+python analyze_decks.py          # 未判別のデッキのみ処理
+python analyze_decks.py --all    # 全デッキを再判別（ルール更新後などに使用）
 ```
-（※一度に大量の分析をしたい場合は `python analyze_decks.py --all` としてください）
 
-## 検証結果
+デッキ判別ルールは `deck_rules.json` で管理しています。新しいデッキタイプを追加する場合はこのファイルを編集してください。
 
-統合テストを実施し、正常に機能することを確認しました。
-- 372件のオープンリーグ（2026年1月23日〜現在）の大会情報を取得しました。
-- Playwrightによる上位8名とデッキの取得、およびデッキカード(60枚)のテキストパースが動作することを検証しました（テスト実行にて2大会分を検証済み）。
+### GUIアプリ（`analyzer_app.py`）
 
-以上でシステムの基盤開発は完了です。必要に応じてコマンドを実行し、データの蓄積をお試しください。
+```powershell
+python analyzer_app.py
+```
+
+**機能タブ:**
+- **1. シェア推移グラフ** — デッキタイプ別の採用率を日次/週次グラフで表示
+- **2. 採用カード分析** — 指定デッキタイプのカード採用率・枚数分布を表示
+- **3. ヘルプ** — 操作方法の説明
+
+**主な操作:**
+- 期間はカレンダーアイコンで選択
+- 凡例クリックで該当デッキをハイライト／それ以外をグレーアウト
+- テーブルはヘッダクリックでソート
+- CSVエクスポートボタンで分析結果を出力
+
+### HTMLレポート生成（`create_report.py`）
+
+```powershell
+python create_report.py
+```
+
+`deck_report.html` が生成されます。ブラウザで開くとデッキタイプ・プレイヤー名・カード内容でフィルタ検索が可能です。
+
+### カード名名寄せ（`normalize_data.py`）
+
+括弧付き表記のカード名（例: `ボスの指令(サカキ)` → `ボスの指令`）を正規化します。DBを更新したあとに実行してください。
+
+```powershell
+python normalize_data.py
+```
+
+### DBクリーンアップ（`cleanup_database.py`）
+
+シティリーグ以外のイベントデータや不正データを削除します。
+
+```powershell
+python cleanup_database.py
+```
+
+---
+
+## DB構造
+
+```
+events         大会情報
+  id, event_holding_id, event_date, shop_name, prefecture, capacity
+
+results        上位8名の結果
+  id, event_id → events, rank, player_name, deck_type
+
+deck_cards     デッキ内カード（約60枚）
+  id, result_id → results, card_name, normalized_card_name, card_code, quantity
+```
+
+---
+
+## 設定（`config.py`）
+
+| 設定値 | デフォルト | 説明 |
+|---|---|---|
+| `START_DATE` | `2026-01-23` | データ収集の開始日（DB空時のフォールバック） |
+| `TOP_N_PLAYERS` | `8` | 取得する上位プレイヤー数 |
+| `LEAGUE_FILTER` | `オープン` | リーグ種別フィルタ |
+| `TITLE_FILTER` | `シティリーグ` | 大会名フィルタ |
+| `SLEEP_BETWEEN_EVENTS` | `3秒` | イベント間のスリープ |
+| `SLEEP_BETWEEN_DECKS` | `3秒` | デッキ間のスリープ |
+
+---
+
+## 推奨運用フロー
+
+```
+【週次 or 任意のタイミングで】
+1. python update_all.py     # データ一括更新（名寄せ・でっきたぷ付与まで全自動）
+2. python analyzer_app.py   # GUIで分析
+   または
+   python create_report.py  # HTMLレポート確認
+```
+
+新シーズンやルール変更後に新しいデッキタイプが出た場合は、`deck_rules.json` にルールを追加してから `python analyze_decks.py --all` で全デッキを再判別してください。
+
+---
+
+## 依存パッケージ
+
+```powershell
+pip install -r requirements.txt
+playwright install chromium
+```

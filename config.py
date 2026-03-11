@@ -10,6 +10,8 @@ EVENT_SEARCH_PARAMS_BASE = {
 EVENT_TYPE_VALUES = ["3:1", "3:2", "3:7"]
 # コード内でオープンリーグのみにフィルタする
 LEAGUE_FILTER = "オープン"
+# 大会名に含まれるべき文字列
+TITLE_FILTER = "シティリーグ"
 EVENT_PAGE_SIZE = 20  # 1回のAPIリクエストで取得する件数
 
 # === ページURL ===

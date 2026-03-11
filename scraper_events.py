@@ -15,6 +15,7 @@ from config import (
     EVENT_SEARCH_PARAMS_BASE,
     EVENT_TYPE_VALUES,
     LEAGUE_FILTER,
+    TITLE_FILTER,
     EVENT_PAGE_SIZE,
     START_DATE,
     SLEEP_BETWEEN_PAGES,
@@ -108,6 +109,11 @@ def fetch_all_new_events(start_date_str=None, end_date_str=None):
             # オープンリーグのみフィルタ
             league_name = ev.get("leagueName", "")
             if league_name != LEAGUE_FILTER:
+                continue
+            
+            # 大会タイトルでフィルタ（「シティリーグ」を含むもののみ）
+            event_title = ev.get("event_title", "")
+            if TITLE_FILTER not in event_title:
                 continue
             
             holding_id = ev.get("event_holding_id")
